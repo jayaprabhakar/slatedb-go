@@ -3,6 +3,7 @@ package slatedb
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"path"
 	"slices"
@@ -12,11 +13,11 @@ import (
 
 	"github.com/maypok86/otter"
 	"github.com/samber/mo"
+	"github.com/slatedb/slatedb-go/internal/sstable"
+	"github.com/slatedb/slatedb-go/internal/sstable/block"
+	"github.com/slatedb/slatedb-go/internal/sstable/bloom"
 	"github.com/slatedb/slatedb-go/slatedb/common"
-	"github.com/slatedb/slatedb-go/slatedb/filter"
-	"github.com/slatedb/slatedb-go/slatedb/logger"
 	"github.com/thanos-io/objstore"
-	"go.uber.org/zap"
 )
 
 // ------------------------------------------------
@@ -27,19 +28,19 @@ import (
 type TableStore struct {
 	mu            sync.RWMutex
 	bucket        objstore.Bucket
-	sstFormat     *SSTableFormat
+	sstConfig     sstable.Config
 	rootPath      string
 	walPath       string
 	compactedPath string
-	filterCache   otter.Cache[SSTableID, mo.Option[filter.BloomFilter]]
+	filterCache   otter.Cache[sstable.ID, mo.Option[bloom.Filter]]
 }
 
-func newTableStore(bucket objstore.Bucket, format *SSTableFormat, rootPath string) *TableStore {
-	cache, err := otter.MustBuilder[SSTableID, mo.Option[filter.BloomFilter]](1000).Build()
+func NewTableStore(bucket objstore.Bucket, sstConfig sstable.Config, rootPath string) *TableStore {
+	cache, err := otter.MustBuilder[sstable.ID, mo.Option[bloom.Filter]](1000).Build()
 	common.AssertTrue(err == nil, "")
 	return &TableStore{
 		bucket:        bucket,
-		sstFormat:     format,
+		sstConfig:     sstConfig,
 		rootPath:      rootPath,
 		walPath:       "wal",
 		compactedPath: "compacted",
@@ -60,115 +61,112 @@ func (ts *TableStore) getWalSSTList(walIDLastCompacted uint64) ([]uint64, error)
 			}
 		}
 		return nil
-	}, objstore.WithRecursiveIter)
+	}, objstore.WithRecursiveIter())
 	if err != nil {
-		logger.Error("unable to iterate over the table list", zap.Error(err))
-		return nil, common.ErrObjectStore
+		return nil, fmt.Errorf("while iterating over the table list: %w", err)
 	}
 
 	slices.Sort(walList)
 	return walList, nil
 }
 
-func (ts *TableStore) tableWriter(sstID SSTableID) *EncodedSSTableWriter {
+func (ts *TableStore) TableWriter(sstID sstable.ID) *EncodedSSTableWriter {
 	return &EncodedSSTableWriter{
+		builder:       sstable.NewBuilder(ts.sstConfig),
 		sstID:         sstID,
-		builder:       ts.sstFormat.tableBuilder(),
 		tableStore:    ts,
 		blocksWritten: 0,
 	}
 }
 
-func (ts *TableStore) tableBuilder() *EncodedSSTableBuilder {
-	return ts.sstFormat.tableBuilder()
+func (ts *TableStore) TableBuilder() *sstable.Builder {
+	return sstable.NewBuilder(ts.sstConfig)
 }
 
-func (ts *TableStore) writeSST(id SSTableID, encodedSST *EncodedSSTable) (*SSTableHandle, error) {
+func (ts *TableStore) WriteSST(id sstable.ID, encodedSST *sstable.Table) (*sstable.Handle, error) {
 	sstPath := ts.sstPath(id)
 
 	blocksData := make([]byte, 0)
-	for i := 0; i < encodedSST.unconsumedBlocks.Len(); i++ {
-		blocksData = append(blocksData, encodedSST.unconsumedBlocks.At(i)...)
+	for i := 0; i < encodedSST.Blocks.Len(); i++ {
+		blocksData = append(blocksData, encodedSST.Blocks.At(i)...)
 	}
 
 	err := ts.bucket.Upload(context.Background(), sstPath, bytes.NewReader(blocksData))
 	if err != nil {
-		logger.Error("unable to upload bucket", zap.Error(err))
-		return nil, common.ErrObjectStore
+		return nil, fmt.Errorf("during object write: %w", err)
 	}
 
-	ts.cacheFilter(id, encodedSST.filter)
-	return newSSTableHandle(id, encodedSST.sstInfo), nil
+	ts.cacheFilter(id, encodedSST.Bloom)
+	return sstable.NewHandle(id, encodedSST.Info), nil
 }
 
-func (ts *TableStore) openSST(id SSTableID) (*SSTableHandle, error) {
+func (ts *TableStore) OpenSST(id sstable.ID) (*sstable.Handle, error) {
 	obj := ReadOnlyObject{ts.bucket, ts.sstPath(id)}
-	sstInfo, err := ts.sstFormat.readInfo(obj)
+	sstInfo, err := sstable.ReadInfo(obj)
 	if err != nil {
-		logger.Error("unable to open table", zap.Error(err))
-		return nil, err
+		return nil, fmt.Errorf("while reading sst info: %w", err)
 	}
 
-	return newSSTableHandle(id, sstInfo), nil
+	return sstable.NewHandle(id, sstInfo), nil
 }
 
-func (ts *TableStore) readBlocks(sstHandle *SSTableHandle, blocksRange common.Range) ([]Block, error) {
-	obj := ReadOnlyObject{ts.bucket, ts.sstPath(sstHandle.id)}
-	index, err := ts.sstFormat.readIndex(sstHandle.info, obj)
+func (ts *TableStore) ReadBlocks(sstHandle *sstable.Handle, blocksRange common.Range) ([]block.Block, error) {
+	obj := ReadOnlyObject{ts.bucket, ts.sstPath(sstHandle.Id)}
+	index, err := sstable.ReadIndex(sstHandle.Info, obj)
 	if err != nil {
 		return nil, err
 	}
-	return ts.sstFormat.readBlocks(sstHandle.info, index, blocksRange, obj)
+	return sstable.ReadBlocks(sstHandle.Info, index, blocksRange, obj)
 }
 
 // Reads specified blocks from an SSTable using the provided index.
-func (ts *TableStore) readBlocksUsingIndex(
-	sstHandle *SSTableHandle,
+func (ts *TableStore) ReadBlocksUsingIndex(
+	sstHandle *sstable.Handle,
 	blocksRange common.Range,
-	index *SSTableIndexData,
-) ([]Block, error) {
-	obj := ReadOnlyObject{ts.bucket, ts.sstPath(sstHandle.id)}
-	return ts.sstFormat.readBlocks(sstHandle.info, index, blocksRange, obj)
+	index *sstable.Index,
+) ([]block.Block, error) {
+	obj := ReadOnlyObject{ts.bucket, ts.sstPath(sstHandle.Id)}
+	return sstable.ReadBlocks(sstHandle.Info, index, blocksRange, obj)
 }
 
-func (ts *TableStore) cacheFilter(sstID SSTableID, filter mo.Option[filter.BloomFilter]) {
+func (ts *TableStore) cacheFilter(sstID sstable.ID, filter mo.Option[bloom.Filter]) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 	ts.filterCache.Set(sstID, filter)
 }
 
-func (ts *TableStore) readFilter(sstHandle *SSTableHandle) (mo.Option[filter.BloomFilter], error) {
+func (ts *TableStore) ReadFilter(sstHandle *sstable.Handle) (mo.Option[bloom.Filter], error) {
 	ts.mu.RLock()
-	val, ok := ts.filterCache.Get(sstHandle.id)
+	val, ok := ts.filterCache.Get(sstHandle.Id)
 	ts.mu.RUnlock()
 	if ok {
 		return val, nil
 	}
 
-	obj := ReadOnlyObject{ts.bucket, ts.sstPath(sstHandle.id)}
-	filtr, err := ts.sstFormat.readFilter(sstHandle.info, obj)
+	obj := ReadOnlyObject{ts.bucket, ts.sstPath(sstHandle.Id)}
+	filtr, err := sstable.ReadFilter(sstHandle.Info, obj)
 	if err != nil {
-		return mo.None[filter.BloomFilter](), err
+		return mo.None[bloom.Filter](), err
 	}
 
-	ts.cacheFilter(sstHandle.id, filtr)
+	ts.cacheFilter(sstHandle.Id, filtr)
 	return filtr, nil
 }
 
-func (ts *TableStore) readIndex(sstHandle *SSTableHandle) (*SSTableIndexData, error) {
-	obj := ReadOnlyObject{ts.bucket, ts.sstPath(sstHandle.id)}
-	index, err := ts.sstFormat.readIndex(sstHandle.info, obj)
+func (ts *TableStore) ReadIndex(sstHandle *sstable.Handle) (*sstable.Index, error) {
+	obj := ReadOnlyObject{ts.bucket, ts.sstPath(sstHandle.Id)}
+	index, err := sstable.ReadIndex(sstHandle.Info, obj)
 	if err != nil {
 		return nil, err
 	}
 	return index, nil
 }
 
-func (ts *TableStore) sstPath(id SSTableID) string {
-	if id.typ == WAL {
-		return path.Join(ts.rootPath, ts.walPath, id.value+".sst")
-	} else if id.typ == Compacted {
-		return path.Join(ts.rootPath, ts.compactedPath, id.value+".sst")
+func (ts *TableStore) sstPath(id sstable.ID) string {
+	if id.Type == sstable.WAL {
+		return path.Join(ts.rootPath, ts.walPath, id.Value+".sst")
+	} else if id.Type == sstable.Compacted {
+		return path.Join(ts.rootPath, ts.compactedPath, id.Value+".sst")
 	}
 	return ""
 }
@@ -180,20 +178,19 @@ func (ts *TableStore) parseID(filepath string, expectedExt string) (uint64, erro
 	idStr := strings.Replace(base, expectedExt, "", 1)
 	id, err := strconv.ParseUint(idStr, 10, 64)
 	if err != nil {
-		logger.Warn("inavlid id", zap.Error(err))
-		return 0, common.ErrInvalidDBState
+		return 0, fmt.Errorf("while parsing id '%s': %w", idStr, err)
 	}
 
 	return id, nil
 }
 
-func (ts *TableStore) clone() *TableStore {
-	cache, err := otter.MustBuilder[SSTableID, mo.Option[filter.BloomFilter]](1000).Build()
+func (ts *TableStore) Clone() *TableStore {
+	cache, err := otter.MustBuilder[sstable.ID, mo.Option[bloom.Filter]](1000).Build()
 	common.AssertTrue(err == nil, "")
 	return &TableStore{
 		mu:            sync.RWMutex{},
 		bucket:        ts.bucket,
-		sstFormat:     ts.sstFormat.clone(),
+		sstConfig:     ts.sstConfig,
 		rootPath:      ts.rootPath,
 		walPath:       ts.walPath,
 		compactedPath: ts.compactedPath,
@@ -203,52 +200,56 @@ func (ts *TableStore) clone() *TableStore {
 
 // ------------------------------------------------
 // EncodedSSTableWriter
+// Thrawn01: (Only Used By The Compactor)
 // ------------------------------------------------
 
 type EncodedSSTableWriter struct {
-	sstID      SSTableID
-	builder    *EncodedSSTableBuilder
+	sstID      sstable.ID
+	builder    *sstable.Builder
 	tableStore *TableStore
 
 	// TODO: we are using an unbounded slice of byte as buffer.
-	//  add a capacity for buffer and when buffer reaches the capacity
+	//  Add a capacity for buffer and when buffer reaches the capacity
 	//  it should be written to object storage
 	buffer        []byte
 	blocksWritten uint64
 }
 
-func (w *EncodedSSTableWriter) add(key []byte, value mo.Option[[]byte]) error {
-	err := w.builder.add(key, value)
+func (w *EncodedSSTableWriter) Add(key []byte, value mo.Option[[]byte]) error {
+	v, _ := value.Get()
+	err := w.builder.AddValue(key, v)
 	if err != nil {
-		logger.Error("unable to add key value", zap.Error(err))
-		return err
+		return fmt.Errorf("builder failed to add key value: %w", err)
 	}
 
 	for {
-		block, ok := w.builder.nextBlock().Get()
+		blk, ok := w.builder.NextBlock().Get()
 		if !ok {
 			break
 		}
-		w.buffer = append(w.buffer, block...)
+		w.buffer = append(w.buffer, blk...)
 		w.blocksWritten += 1
 	}
 
 	return nil
 }
 
-func (w *EncodedSSTableWriter) close() (*SSTableHandle, error) {
-	encodedSST, err := w.builder.build()
+func (w *EncodedSSTableWriter) Written() uint64 {
+	return w.blocksWritten
+}
+
+func (w *EncodedSSTableWriter) Close() (*sstable.Handle, error) {
+	encodedSST, err := w.builder.Build()
 	if err != nil {
-		logger.Error("unable to close SS Table", zap.Error(err))
-		return nil, err
+		return nil, fmt.Errorf("SST build failed: %w", err)
 	}
 
 	blocksData := w.buffer
 	for {
-		if encodedSST.unconsumedBlocks.Len() == 0 {
+		if encodedSST.Blocks.Len() == 0 {
 			break
 		}
-		blocksData = append(blocksData, encodedSST.unconsumedBlocks.PopFront()...)
+		blocksData = append(blocksData, encodedSST.Blocks.PopFront()...)
 	}
 
 	sstPath := w.tableStore.sstPath(w.sstID)
@@ -257,8 +258,8 @@ func (w *EncodedSSTableWriter) close() (*SSTableHandle, error) {
 		return nil, common.ErrObjectStore
 	}
 
-	w.tableStore.cacheFilter(w.sstID, encodedSST.filter)
-	return newSSTableHandle(w.sstID, encodedSST.sstInfo), nil
+	w.tableStore.cacheFilter(w.sstID, encodedSST.Bloom)
+	return sstable.NewHandle(w.sstID, encodedSST.Info), nil
 }
 
 // ------------------------------------------------
@@ -273,8 +274,7 @@ type ReadOnlyObject struct {
 func (r ReadOnlyObject) Len() (int, error) {
 	attr, err := r.bucket.Attributes(context.Background(), r.path)
 	if err != nil {
-		logger.Warn("invalid object", zap.Error(err))
-		return 0, common.ErrObjectStore
+		return 0, fmt.Errorf("while fetching object attributes: %w", err)
 	}
 	return int(attr.Size), nil
 }
@@ -282,14 +282,12 @@ func (r ReadOnlyObject) Len() (int, error) {
 func (r ReadOnlyObject) ReadRange(rng common.Range) ([]byte, error) {
 	read, err := r.bucket.GetRange(context.Background(), r.path, int64(rng.Start), int64(rng.End-rng.Start))
 	if err != nil {
-		logger.Warn("invalid object", zap.Error(err))
-		return nil, common.ErrObjectStore
+		return nil, fmt.Errorf("while fetching object range [%d:%d]: %w", rng.Start, rng.End-rng.Start, err)
 	}
 
 	data, err := io.ReadAll(read)
 	if err != nil {
-		logger.Error("unable to read data", zap.Error(err))
-		return nil, common.ErrObjectStore
+		return nil, fmt.Errorf("while reading object [%d:%d]: %w", rng.Start, rng.End, err)
 	}
 
 	return data, nil
@@ -298,14 +296,12 @@ func (r ReadOnlyObject) ReadRange(rng common.Range) ([]byte, error) {
 func (r ReadOnlyObject) Read() ([]byte, error) {
 	read, err := r.bucket.Get(context.Background(), r.path)
 	if err != nil {
-		logger.Error("unable to get bucket", zap.Error(err))
-		return nil, common.ErrObjectStore
+		return nil, fmt.Errorf("while fetching object '%s': %w", r.path, err)
 	}
 
 	data, err := io.ReadAll(read)
 	if err != nil {
-		logger.Error("unable to read data", zap.Error(err))
-		return nil, common.ErrObjectStore
+		return nil, fmt.Errorf("while reading object '%s': %w", r.path, err)
 	}
 
 	return data, nil

@@ -1,6 +1,10 @@
 package slatedb
 
 import (
+	"github.com/slatedb/slatedb-go/internal/compress"
+	"github.com/slatedb/slatedb-go/internal/sstable"
+	"github.com/slatedb/slatedb-go/internal/types"
+	"log/slog"
 	"math"
 	"slices"
 	"testing"
@@ -14,7 +18,7 @@ import (
 )
 
 func TestCompactorCompactsL0(t *testing.T) {
-	options := dbOptions(compactorOptions())
+	options := dbOptions(compactorOptions().CompactorOptions)
 	_, manifestStore, tableStore, db := buildTestDB(options)
 	defer db.Close()
 	for i := 0; i < 4; i++ {
@@ -46,28 +50,24 @@ func TestCompactorCompactsL0(t *testing.T) {
 	assert.Equal(t, 1, len(compactedSSTList))
 
 	sst := compactedSSTList[0]
-	iter, err := newSSTIterator(&sst, tableStore, 1, 1)
+	iter, err := sstable.NewIterator(&sst, tableStore, 1, 1)
 	assert.NoError(t, err)
 	for i := 0; i < 4; i++ {
-		next, err := iter.Next()
-		assert.NoError(t, err)
-		assert.True(t, next.IsPresent())
-		kv, _ := next.Get()
+		kv, ok := iter.Next()
+		assert.True(t, ok)
 		assert.Equal(t, repeatedChar(rune('a'+i), 16), kv.Key)
 		assert.Equal(t, repeatedChar(rune('b'+i), 48), kv.Value)
 	}
 	for i := 0; i < 4; i++ {
-		next, err := iter.Next()
-		assert.NoError(t, err)
-		assert.True(t, next.IsPresent())
-		kv, _ := next.Get()
+		kv, ok := iter.Next()
+		assert.True(t, ok)
 		assert.Equal(t, repeatedChar(rune('j'+i), 16), kv.Key)
 		assert.Equal(t, repeatedChar(rune('k'+i), 48), kv.Value)
 	}
 
-	next, err := iter.Next()
-	assert.NoError(t, err)
-	assert.False(t, next.IsPresent())
+	next, ok := iter.Next()
+	assert.False(t, ok)
+	assert.Equal(t, types.KeyValue{}, next)
 }
 
 func TestShouldWriteManifestSafely(t *testing.T) {
@@ -87,7 +87,7 @@ func TestShouldWriteManifestSafely(t *testing.T) {
 
 	l0IDsToCompact := make([]SourceID, 0)
 	for _, sst := range orchestrator.state.dbState.l0 {
-		id, ok := sst.id.compactedID().Get()
+		id, ok := sst.Id.CompactedID().Get()
 		assert.True(t, ok)
 		l0IDsToCompact = append(l0IDsToCompact, newSourceIDSST(id))
 	}
@@ -113,11 +113,11 @@ func TestShouldWriteManifestSafely(t *testing.T) {
 	assert.Equal(t, 1, len(dbState.l0))
 	assert.Equal(t, 1, len(dbState.compacted))
 
-	l0ID, ok := dbState.l0[0].id.compactedID().Get()
+	l0ID, ok := dbState.l0[0].Id.CompactedID().Get()
 	assert.True(t, ok)
 	compactedSSTIDs := make([]ulid.ULID, 0)
 	for _, sst := range dbState.compacted[0].sstList {
-		id, ok := sst.id.compactedID().Get()
+		id, ok := sst.Id.CompactedID().Get()
 		assert.True(t, ok)
 		compactedSSTIDs = append(compactedSSTIDs, id)
 	}
@@ -129,12 +129,12 @@ func buildTestDB(options DBOptions) (objstore.Bucket, *ManifestStore, *TableStor
 	bucket := objstore.NewInMemBucket()
 	db, err := OpenWithOptions(testPath, bucket, options)
 	common.AssertTrue(err == nil, "Failed to open test database")
-	sstFormat := defaultSSTableFormat()
-	sstFormat.blockSize = 32
-	sstFormat.minFilterKeys = 10
-	sstFormat.compressionCodec = options.CompressionCodec
+	conf := sstable.DefaultConfig()
+	conf.BlockSize = 32
+	conf.MinFilterKeys = 10
+	conf.Compression = options.CompressionCodec
 	manifestStore := newManifestStore(testPath, bucket)
-	tableStore := newTableStore(bucket, sstFormat, testPath)
+	tableStore := NewTableStore(bucket, conf, testPath)
 	return bucket, manifestStore, tableStore, db
 }
 
@@ -145,13 +145,16 @@ func dbOptions(compactorOptions *CompactorOptions) DBOptions {
 		MinFilterKeys:        0,
 		L0SSTSizeBytes:       128,
 		CompactorOptions:     compactorOptions,
-		CompressionCodec:     CompressionNone,
+		CompressionCodec:     compress.CodecNone,
 	}
 }
 
-func compactorOptions() *CompactorOptions {
-	return &CompactorOptions{
-		PollInterval: 100 * time.Millisecond,
-		MaxSSTSize:   1024 * 1024 * 1024,
+func compactorOptions() DBOptions {
+	return DBOptions{
+		CompactorOptions: &CompactorOptions{
+			PollInterval: 100 * time.Millisecond,
+			MaxSSTSize:   1024 * 1024 * 1024,
+		},
+		Log: slog.Default(),
 	}
 }

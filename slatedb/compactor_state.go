@@ -1,16 +1,15 @@
 package slatedb
 
 import (
-	"maps"
+	"github.com/kapetan-io/tackle/set"
+	"github.com/slatedb/slatedb-go/internal/sstable"
+	"log/slog"
 	"math"
-	"slices"
 	"strconv"
 
 	"github.com/oklog/ulid/v2"
 	"github.com/samber/mo"
 	"github.com/slatedb/slatedb-go/slatedb/common"
-	"github.com/slatedb/slatedb-go/slatedb/logger"
-	"go.uber.org/zap"
 )
 
 // ------------------------------------------------
@@ -29,13 +28,6 @@ type SourceID struct {
 	value string
 }
 
-func newSourceIDSortedRun(id uint32) SourceID {
-	return SourceID{
-		typ:   SortedRunID,
-		value: strconv.Itoa(int(id)),
-	}
-}
-
 func newSourceIDSST(id ulid.ULID) SourceID {
 	return SourceID{
 		typ:   SSTID,
@@ -49,7 +41,6 @@ func (s SourceID) sortedRunID() mo.Option[uint32] {
 	}
 	val, err := strconv.Atoi(s.value)
 	if err != nil {
-		logger.Error("unable to parse source id", zap.Error(err))
 		return mo.None[uint32]()
 	}
 	return mo.Some(uint32(val))
@@ -61,7 +52,6 @@ func (s SourceID) sstID() mo.Option[ulid.ULID] {
 	}
 	val, err := ulid.Parse(s.value)
 	if err != nil {
-		logger.Error("unable to parse source id", zap.Error(err))
 		return mo.None[ulid.ULID]()
 	}
 	return mo.Some(val)
@@ -99,17 +89,17 @@ func newCompaction(sources []SourceID, destination uint32) Compaction {
 type CompactorState struct {
 	dbState     *CoreDBState
 	compactions map[uint32]Compaction
+	log         *slog.Logger
 }
 
-func newCompactorState(dbState *CoreDBState) *CompactorState {
+func newCompactorState(dbState *CoreDBState, log *slog.Logger) *CompactorState {
+	set.Default(&log, slog.Default())
+
 	return &CompactorState{
-		dbState:     dbState,
 		compactions: map[uint32]Compaction{},
+		dbState:     dbState,
+		log:         log,
 	}
-}
-
-func (c *CompactorState) getCompactions() []Compaction {
-	return slices.Collect(maps.Values(c.compactions))
 }
 
 func (c *CompactorState) submitCompaction(compaction Compaction) error {
@@ -129,7 +119,7 @@ func (c *CompactorState) submitCompaction(compaction Compaction) error {
 		}
 	}
 
-	logger.Info("accepted submitted compaction:", zap.Any("compaction", compaction))
+	c.log.Info("accepted submitted compaction:", "compaction", compaction)
 	c.compactions[compaction.destination] = compaction
 	return nil
 }
@@ -149,11 +139,11 @@ func (c *CompactorState) oneOfTheSourceSRMatchesDestination(compaction Compactio
 func (c *CompactorState) refreshDBState(writerState *CoreDBState) {
 	// the writer may have added more l0 SSTs. Add these to our l0 list.
 	lastCompactedL0 := c.dbState.l0LastCompacted
-	mergedL0s := make([]SSTableHandle, 0)
+	mergedL0s := make([]sstable.Handle, 0)
 
 	for _, writerL0SST := range writerState.l0 {
-		common.AssertTrue(writerL0SST.id.typ == Compacted, "unexpected SSTableID type")
-		writerL0ID, _ := writerL0SST.id.compactedID().Get()
+		common.AssertTrue(writerL0SST.Id.Type == sstable.Compacted, "unexpected sstable.ID type")
+		writerL0ID, _ := writerL0SST.Id.CompactedID().Get()
 		// we stop appending to our l0 list if we encounter sstID equal to lastCompactedID
 		lastCompactedL0ID, _ := lastCompactedL0.Get()
 		if lastCompactedL0.IsPresent() && writerL0ID == lastCompactedL0ID {
@@ -164,8 +154,8 @@ func (c *CompactorState) refreshDBState(writerState *CoreDBState) {
 
 	merged := c.dbState.clone()
 	merged.l0 = mergedL0s
-	merged.lastCompactedWalSSTID = writerState.lastCompactedWalSSTID
-	merged.nextWalSstID = writerState.nextWalSstID
+	merged.lastCompactedWalSSTID.Store(writerState.lastCompactedWalSSTID.Load())
+	merged.nextWalSstID.Store(writerState.nextWalSstID.Load())
 	c.dbState = merged
 }
 
@@ -176,7 +166,7 @@ func (c *CompactorState) finishCompaction(outputSR *SortedRun) {
 	if !ok {
 		return
 	}
-	logger.Info("finished compaction", zap.Any("compaction", compaction))
+	c.log.Info("finished compaction", "compaction", compaction)
 
 	compactionL0s := make(map[ulid.ULID]bool)
 	compactionSRs := make(map[uint32]bool)
@@ -192,10 +182,10 @@ func (c *CompactorState) finishCompaction(outputSR *SortedRun) {
 	compactionSRs[compaction.destination] = true
 
 	dbState := c.dbState.clone()
-	newL0 := make([]SSTableHandle, 0)
+	newL0 := make([]sstable.Handle, 0)
 	for _, sst := range dbState.l0 {
-		common.AssertTrue(sst.id.compactedID().IsPresent(), "Expected compactedID not present")
-		l0ID, _ := sst.id.compactedID().Get()
+		common.AssertTrue(sst.Id.CompactedID().IsPresent(), "Expected compactedID not present")
+		l0ID, _ := sst.Id.CompactedID().Get()
 		_, ok := compactionL0s[l0ID]
 		if !ok {
 			newL0 = append(newL0, sst)

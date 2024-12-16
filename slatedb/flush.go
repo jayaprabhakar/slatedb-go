@@ -2,28 +2,32 @@ package slatedb
 
 import (
 	"errors"
+	"github.com/slatedb/slatedb-go/internal/sstable"
+	"github.com/slatedb/slatedb-go/slatedb/table"
+	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/oklog/ulid/v2"
-	"github.com/samber/mo"
 	"github.com/slatedb/slatedb-go/slatedb/common"
-	"github.com/slatedb/slatedb-go/slatedb/logger"
-	"go.uber.org/zap"
 )
 
 func (db *DB) spawnWALFlushTask(walFlushNotifierCh <-chan bool, walFlushTaskWG *sync.WaitGroup) {
 	walFlushTaskWG.Add(1)
 	go func() {
 		defer walFlushTaskWG.Done()
-		ticker := time.NewTicker(db.options.FlushInterval)
+		ticker := time.NewTicker(db.opts.FlushInterval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				db.FlushWAL()
+				if err := db.FlushWAL(); err != nil {
+					db.opts.Log.Warn("Flush WAL failed", "error", err)
+				}
 			case <-walFlushNotifierCh:
-				db.FlushWAL()
+				if err := db.FlushWAL(); err != nil {
+					db.opts.Log.Warn("Flush WAL failed", "error", err)
+				}
 				return
 			}
 		}
@@ -31,12 +35,8 @@ func (db *DB) spawnWALFlushTask(walFlushNotifierCh <-chan bool, walFlushTaskWG *
 }
 
 // FlushWAL
-//  1. Convert mutable WAL to Immutable WAL
-//  2. For each Immutable WAL
-//     Flush Immutable WAL to Object store
-//     Flush Immutable WAL to mutable Memtable
-//     If memtable has reached size L0SSTBytes then convert memtable to Immutable memtable
-//     Notify any client(with AwaitFlush set to true) that flush has happened
+// 1. Convert mutable WAL to Immutable WAL
+// 2. Flush each Immutable WAL to object store and then to memtable
 func (db *DB) FlushWAL() error {
 	db.state.freezeWAL()
 	err := db.flushImmWALs()
@@ -46,13 +46,19 @@ func (db *DB) FlushWAL() error {
 	return nil
 }
 
+// For each Immutable WAL
+// Flush Immutable WAL to Object store
+// Flush Immutable WAL to mutable Memtable
+// If memtable has reached size L0SSTBytes then convert memtable to Immutable memtable
+// Notify any client(with AwaitFlush set to true) that flush has happened
 func (db *DB) flushImmWALs() error {
 	for {
-		walList := db.state.getState().immWAL
-		if walList == nil || walList.Len() == 0 {
+		oldestWal := db.state.oldestImmWAL()
+		if oldestWal.IsAbsent() {
 			break
 		}
-		immWal := walList.Back()
+
+		immWal := oldestWal.MustGet()
 		// Flush Immutable WAL to Object store
 		_, err := db.flushImmWAL(immWal)
 		if err != nil {
@@ -61,60 +67,59 @@ func (db *DB) flushImmWALs() error {
 		db.state.popImmWAL()
 
 		// flush to the memtable before notifying so that data is available for reads
-		db.flushImmWALToMemtable(immWal, db.state.memtable)
-		db.maybeFreezeMemtable(db.state, immWal.id)
-		immWal.table.notifyWALFlushed()
+		db.flushImmWALToMemtable(immWal, db.state.Memtable())
+		db.maybeFreezeMemtable(db.state, immWal.ID())
+		immWal.Table().NotifyWALFlushed()
 	}
 	return nil
 }
 
-func (db *DB) flushImmWAL(imm ImmutableWAL) (*SSTableHandle, error) {
-	walID := newSSTableIDWal(imm.id)
-	return db.flushImmTable(walID, imm.table)
+func (db *DB) flushImmWAL(immWAL *table.ImmutableWAL) (*sstable.Handle, error) {
+	walID := sstable.NewIDWal(immWAL.ID())
+	return db.flushImmTable(walID, immWAL.Iter())
 }
 
-func (db *DB) flushImmWALToMemtable(immWal ImmutableWAL, memtable *Memtable) {
-	iter := immWal.table.iter()
+func (db *DB) flushImmWALToMemtable(immWal *table.ImmutableWAL, memtable *table.Memtable) {
+	iter := immWal.Iter()
 	for {
 		entry, err := iter.NextEntry()
 		if err != nil || entry.IsAbsent() {
 			break
 		}
 		kv, _ := entry.Get()
-		if kv.ValueDel.IsTombstone {
-			memtable.delete(kv.Key)
+		if kv.Value.IsTombstone() {
+			memtable.Delete(kv.Key)
 		} else {
-			memtable.put(kv.Key, kv.ValueDel.Value)
+			memtable.Put(kv.Key, kv.Value.Value)
 		}
 	}
-	memtable.lastWalID = mo.Some(immWal.id)
+	memtable.SetLastWalID(immWal.ID())
 }
 
-func (db *DB) flushImmTable(id SSTableID, immTable *KVTable) (*SSTableHandle, error) {
-	sstBuilder := db.tableStore.tableBuilder()
-	iter := immTable.iter()
+func (db *DB) flushImmTable(id sstable.ID, iter *table.KVTableIterator) (*sstable.Handle, error) {
+	sstBuilder := db.tableStore.TableBuilder()
 	for {
 		entry, err := iter.NextEntry()
 		if err != nil || entry.IsAbsent() {
 			break
 		}
 		kv, _ := entry.Get()
-		val := mo.None[[]byte]()
-		if !kv.ValueDel.IsTombstone {
-			val = mo.Some(kv.ValueDel.Value)
+		var val []byte
+		if !kv.Value.IsTombstone() {
+			val = kv.Value.Value
 		}
-		err = sstBuilder.add(kv.Key, val)
+		err = sstBuilder.AddValue(kv.Key, val)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	encodedSST, err := sstBuilder.build()
+	encodedSST, err := sstBuilder.Build()
 	if err != nil {
 		return nil, err
 	}
 
-	sst, err := db.tableStore.writeSST(id, encodedSST)
+	sst, err := db.tableStore.WriteSST(id, encodedSST)
 	if err != nil {
 		return nil, err
 	}
@@ -136,10 +141,11 @@ func (db *DB) spawnMemtableFlushTask(
 	go func() {
 		defer memtableFlushTaskWG.Done()
 		flusher := MemtableFlusher{
-			db:       db,
+			log:      db.opts.Log,
 			manifest: manifest,
+			db:       db,
 		}
-		ticker := time.NewTicker(db.options.ManifestPollInterval)
+		ticker := time.NewTicker(db.opts.ManifestPollInterval)
 		defer ticker.Stop()
 
 		// Stop the loop when the shut down has been received and all
@@ -149,7 +155,7 @@ func (db *DB) spawnMemtableFlushTask(
 			case <-ticker.C:
 				err := flusher.loadManifest()
 				if err != nil {
-					logger.Error("error load manifest", zap.Error(err))
+					db.opts.Log.Error("error load manifest", "error", err)
 				}
 			case val := <-memtableFlushNotifierCh:
 				if val == Shutdown {
@@ -157,7 +163,7 @@ func (db *DB) spawnMemtableFlushTask(
 				} else if val == FlushImmutableMemtables {
 					err := flusher.flushImmMemtablesToL0()
 					if err != nil {
-						logger.Error("Error flushing memtable", zap.Error(err))
+						db.opts.Log.Error("error flushing memtable", "error", err)
 					}
 				}
 			}
@@ -165,7 +171,7 @@ func (db *DB) spawnMemtableFlushTask(
 
 		err := flusher.writeManifestSafely()
 		if err != nil {
-			logger.Error("error writing manifest on shutdown", zap.Error(err))
+			db.opts.Log.Error("error writing manifest on shutdown", "error", err)
 		}
 	}()
 }
@@ -180,6 +186,7 @@ const (
 type MemtableFlusher struct {
 	db       *DB
 	manifest *FenceableManifest
+	log      *slog.Logger
 }
 
 func (m *MemtableFlusher) loadManifest() error {
@@ -192,7 +199,7 @@ func (m *MemtableFlusher) loadManifest() error {
 }
 
 func (m *MemtableFlusher) writeManifest() error {
-	core := m.db.state.getState().core
+	core := m.db.state.coreStateClone()
 	return m.manifest.updateDBState(core)
 }
 
@@ -205,7 +212,7 @@ func (m *MemtableFlusher) writeManifestSafely() error {
 
 		err = m.writeManifest()
 		if errors.Is(err, common.ErrManifestVersionExists) {
-			logger.Warn("conflicting manifest version. retry write", zap.Error(err))
+			m.log.Warn("conflicting manifest version. retry write", "error", err)
 		} else if err != nil {
 			return err
 		} else {
@@ -216,19 +223,18 @@ func (m *MemtableFlusher) writeManifestSafely() error {
 
 func (m *MemtableFlusher) flushImmMemtablesToL0() error {
 	for {
-		state := m.db.state.getState()
-		if state.immMemtable.Len() == 0 {
+		immMemtable := m.db.state.oldestImmMemtable()
+		if immMemtable.IsAbsent() {
 			break
 		}
 
-		immMemtable := state.immMemtable.Back()
-		id := newSSTableIDCompacted(ulid.Make())
-		sstHandle, err := m.db.flushImmTable(id, immMemtable.table)
+		id := sstable.NewIDCompacted(ulid.Make())
+		sstHandle, err := m.db.flushImmTable(id, immMemtable.MustGet().Iter())
 		if err != nil {
 			return err
 		}
 
-		m.db.state.moveImmMemtableToL0(immMemtable, sstHandle)
+		m.db.state.moveImmMemtableToL0(immMemtable.MustGet(), sstHandle)
 		err = m.writeManifestSafely()
 		if err != nil {
 			return err

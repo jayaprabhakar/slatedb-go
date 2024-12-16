@@ -2,11 +2,12 @@ package slatedb
 
 import (
 	"bytes"
+	"github.com/slatedb/slatedb-go/internal/sstable"
+	"github.com/slatedb/slatedb-go/internal/types"
 
 	"github.com/samber/mo"
 	"github.com/slatedb/slatedb-go/slatedb/common"
-	"github.com/slatedb/slatedb-go/slatedb/logger"
-	"go.uber.org/zap"
+	"sort"
 )
 
 // ------------------------------------------------
@@ -15,42 +16,32 @@ import (
 
 type SortedRun struct {
 	id      uint32
-	sstList []SSTableHandle
+	sstList []sstable.Handle
 }
 
 func (s *SortedRun) indexOfSSTWithKey(key []byte) mo.Option[int] {
-	index := 0
-	// TODO: Rust implementation uses partition_point() which internally uses binary search
-	//  we are doing linear search. See if we can optimize
-	for i, sst := range s.sstList {
-		firstKey, ok := sst.info.firstKey.Get()
-		common.AssertTrue(ok, "sst must have first key")
-		if bytes.Compare(firstKey, key) > 0 {
-			index = i
-			break
-		} else if i == len(s.sstList)-1 {
-			index = i + 1
-			break
-		}
-	}
+	index := sort.Search(len(s.sstList), func(i int) bool {
+		common.AssertTrue(len(s.sstList[i].Info.FirstKey) != 0, "sst must have first key")
+		return bytes.Compare(s.sstList[i].Info.FirstKey, key) > 0
+	})
 	if index > 0 {
 		return mo.Some(index - 1)
 	}
 	return mo.None[int]()
 }
 
-func (s *SortedRun) sstWithKey(key []byte) mo.Option[SSTableHandle] {
+func (s *SortedRun) sstWithKey(key []byte) mo.Option[sstable.Handle] {
 	index, ok := s.indexOfSSTWithKey(key).Get()
 	if ok {
 		return mo.Some(s.sstList[index])
 	}
-	return mo.None[SSTableHandle]()
+	return mo.None[sstable.Handle]()
 }
 
 func (s *SortedRun) clone() *SortedRun {
-	sstList := make([]SSTableHandle, 0, len(s.sstList))
+	sstList := make([]sstable.Handle, 0, len(s.sstList))
 	for _, sst := range s.sstList {
-		sstList = append(sstList, *sst.clone())
+		sstList = append(sstList, *sst.Clone())
 	}
 	return &SortedRun{
 		id:      s.id,
@@ -63,11 +54,12 @@ func (s *SortedRun) clone() *SortedRun {
 // ------------------------------------------------
 
 type SortedRunIterator struct {
-	currentKVIter     mo.Option[*SSTIterator]
+	currentKVIter     mo.Option[*sstable.Iterator]
 	sstListIter       *SSTListIterator
 	tableStore        *TableStore
 	numBlocksToFetch  uint64
 	numBlocksToBuffer uint64
+	warn              types.ErrWarn
 }
 
 func newSortedRunIterator(
@@ -96,7 +88,7 @@ func newSortedRunIteratorFromKey(
 }
 
 func newSortedRunIter(
-	sstList []SSTableHandle,
+	sstList []sstable.Handle,
 	tableStore *TableStore,
 	maxFetchTasks uint64,
 	numBlocksToFetch uint64,
@@ -104,19 +96,19 @@ func newSortedRunIter(
 ) (*SortedRunIterator, error) {
 
 	sstListIter := newSSTListIterator(sstList)
-	currentKVIter := mo.None[*SSTIterator]()
+	currentKVIter := mo.None[*sstable.Iterator]()
 	sst, ok := sstListIter.Next()
 	if ok {
-		var iter *SSTIterator
+		var iter *sstable.Iterator
 		var err error
 		if fromKey.IsPresent() {
 			key, _ := fromKey.Get()
-			iter, err = newSSTIteratorFromKey(&sst, key, tableStore, maxFetchTasks, numBlocksToFetch)
+			iter, err = sstable.NewIteratorAtKey(&sst, key, tableStore, maxFetchTasks, numBlocksToFetch)
 			if err != nil {
 				return nil, err
 			}
 		} else {
-			iter, err = newSSTIterator(&sst, tableStore, maxFetchTasks, numBlocksToFetch)
+			iter, err = sstable.NewIterator(&sst, tableStore, maxFetchTasks, numBlocksToFetch)
 			if err != nil {
 				return nil, err
 			}
@@ -134,58 +126,60 @@ func newSortedRunIter(
 	}, nil
 }
 
-func (iter *SortedRunIterator) Next() (mo.Option[common.KV], error) {
+func (iter *SortedRunIterator) Next() (types.KeyValue, bool) {
 	for {
-		entry, err := iter.NextEntry()
-		if err != nil {
-			return mo.None[common.KV](), err
+		keyVal, ok := iter.NextEntry()
+		if !ok {
+			return types.KeyValue{}, false
 		}
-		keyVal, ok := entry.Get()
-		if ok {
-			if keyVal.ValueDel.IsTombstone {
-				continue
-			}
+		if keyVal.Value.IsTombstone() {
+			continue
+		}
 
-			return mo.Some(common.KV{
-				Key:   keyVal.Key,
-				Value: keyVal.ValueDel.Value,
-			}), nil
-		} else {
-			return mo.None[common.KV](), nil
-		}
+		return types.KeyValue{
+			Key:   keyVal.Key,
+			Value: keyVal.Value.Value,
+		}, true
 	}
 }
 
-func (iter *SortedRunIterator) NextEntry() (mo.Option[common.KVDeletable], error) {
+func (iter *SortedRunIterator) NextEntry() (types.RowEntry, bool) {
 	for {
 		if iter.currentKVIter.IsAbsent() {
-			return mo.None[common.KVDeletable](), nil
+			return types.RowEntry{}, false
 		}
 
 		kvIter, _ := iter.currentKVIter.Get()
-		next, err := kvIter.NextEntry()
-		if err != nil {
-			logger.Error("unable to get next entry", zap.Error(err))
-			return mo.None[common.KVDeletable](), err
-		}
-
-		if next.IsPresent() {
-			kv, _ := next.Get()
-			return mo.Some(kv), nil
+		kv, ok := kvIter.NextEntry()
+		if ok {
+			return kv, true
+		} else {
+			if warn := kvIter.Warnings(); warn != nil {
+				iter.warn.Merge(warn)
+			}
 		}
 
 		sst, ok := iter.sstListIter.Next()
 		if !ok {
-			return mo.None[common.KVDeletable](), nil
+			if warn := kvIter.Warnings(); warn != nil {
+				iter.warn.Merge(warn)
+			}
+			return types.RowEntry{}, false
 		}
 
-		newKVIter, err := newSSTIterator(&sst, iter.tableStore, iter.numBlocksToFetch, iter.numBlocksToBuffer)
+		newKVIter, err := sstable.NewIterator(&sst, iter.tableStore, iter.numBlocksToFetch, iter.numBlocksToBuffer)
 		if err != nil {
-			return mo.None[common.KVDeletable](), err
+			iter.warn.Add("while creating SSTable iterator: %s", err.Error())
+			return types.RowEntry{}, false
 		}
 
 		iter.currentKVIter = mo.Some(newKVIter)
 	}
+}
+
+// Warnings returns types.ErrWarn if there was a warning during iteration.
+func (iter *SortedRunIterator) Warnings() *types.ErrWarn {
+	return &iter.warn
 }
 
 // ------------------------------------------------
@@ -193,17 +187,17 @@ func (iter *SortedRunIterator) NextEntry() (mo.Option[common.KVDeletable], error
 // ------------------------------------------------
 
 type SSTListIterator struct {
-	sstList []SSTableHandle
+	sstList []sstable.Handle
 	current int
 }
 
-func newSSTListIterator(sstList []SSTableHandle) *SSTListIterator {
+func newSSTListIterator(sstList []sstable.Handle) *SSTListIterator {
 	return &SSTListIterator{sstList, 0}
 }
 
-func (iter *SSTListIterator) Next() (SSTableHandle, bool) {
+func (iter *SSTListIterator) Next() (sstable.Handle, bool) {
 	if iter.current >= len(iter.sstList) {
-		return SSTableHandle{}, false
+		return sstable.Handle{}, false
 	}
 	sst := iter.sstList[iter.current]
 	iter.current++

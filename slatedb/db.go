@@ -3,23 +3,26 @@ package slatedb
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"github.com/kapetan-io/tackle/set"
+	"github.com/slatedb/slatedb-go/internal/sstable"
+	"github.com/slatedb/slatedb-go/internal/types"
+	"log/slog"
 	"math"
 	"sync"
 
 	"github.com/slatedb/slatedb-go/slatedb/common"
-	"github.com/slatedb/slatedb-go/slatedb/logger"
 	"github.com/thanos-io/objstore"
-	"go.uber.org/zap"
 )
 
 const BlockSize = 4096
 
 type DB struct {
-	state      *DBState
-	options    DBOptions
-	tableStore *TableStore
 	manifest   *FenceableManifest
+	tableStore *TableStore
 	compactor  *Compactor
+	opts       DBOptions
+	state      *DBState
 
 	// walFlushNotifierCh - When DB.Close is called, we send a notification to this channel
 	// and the goroutine running the walFlush task reads this channel and shuts down
@@ -41,14 +44,13 @@ func Open(path string, bucket objstore.Bucket) (*DB, error) {
 }
 
 func OpenWithOptions(path string, bucket objstore.Bucket, options DBOptions) (*DB, error) {
-	logger.Init()
-	logger.Info("Application started")
-	sstFormat := defaultSSTableFormat()
-	sstFormat.blockSize = BlockSize
-	sstFormat.minFilterKeys = options.MinFilterKeys
-	sstFormat.compressionCodec = options.CompressionCodec
+	conf := sstable.DefaultConfig()
+	conf.BlockSize = BlockSize
+	conf.MinFilterKeys = options.MinFilterKeys
+	conf.Compression = options.CompressionCodec
+	set.Default(&options.Log, slog.Default())
 
-	tableStore := newTableStore(bucket, sstFormat, path)
+	tableStore := NewTableStore(bucket, conf, path)
 	manifestStore := newManifestStore(path, bucket)
 	manifest, err := getManifest(manifestStore)
 
@@ -64,7 +66,7 @@ func OpenWithOptions(path string, bucket objstore.Bucket, options DBOptions) (*D
 
 	db, err := newDB(options, tableStore, state, memtableFlushNotifierCh)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("during db init: %w", err)
 	}
 	db.manifest = manifest
 
@@ -78,11 +80,10 @@ func OpenWithOptions(path string, bucket objstore.Bucket, options DBOptions) (*D
 	db.spawnMemtableFlushTask(manifest, memtableFlushNotifierCh, db.memtableFlushTaskWG)
 
 	var compactor *Compactor
-	if db.options.CompactorOptions != nil {
-		compactor, err = newCompactor(manifestStore, tableStore, db.options.CompactorOptions)
+	if db.opts.CompactorOptions != nil {
+		compactor, err = newCompactor(manifestStore, tableStore, db.opts)
 		if err != nil {
-			logger.Error("unable to create compactor", zap.Error(err))
-			return nil, err
+			return nil, fmt.Errorf("while creating compactor: %w", err)
 		}
 	}
 	db.compactor = compactor
@@ -91,8 +92,6 @@ func OpenWithOptions(path string, bucket objstore.Bucket, options DBOptions) (*D
 }
 
 func (db *DB) Close() error {
-	defer logger.Sync()
-
 	if db.compactor != nil {
 		db.compactor.close()
 	}
@@ -115,13 +114,12 @@ func (db *DB) Put(key []byte, value []byte) {
 func (db *DB) PutWithOptions(key []byte, value []byte, options WriteOptions) {
 	common.AssertTrue(len(key) > 0, "key cannot be empty")
 
-	currentWAL := db.state.wal
-	currentWAL.put(key, value)
+	currentWAL := db.state.PutKVToWAL(key, value)
 	if options.AwaitFlush {
 		// we wait for WAL to be flushed to memtable and then we send a notification
 		// to goroutine to flush memtable to L0. we do not wait till its flushed to L0
 		// because client can read the key from memtable
-		<-currentWAL.table.awaitWALFlush()
+		currentWAL.Table().AwaitWALFlush()
 	}
 }
 
@@ -140,15 +138,15 @@ func (db *DB) GetWithOptions(key []byte, options ReadOptions) ([]byte, error) {
 
 	if options.ReadLevel == Uncommitted {
 		// search for key in mutable WAL
-		val, ok := snapshot.wal.get(key).Get()
+		val, ok := snapshot.wal.Get(key).Get()
 		if ok { // key is present or tombstoned
 			return checkValue(val)
 		}
 		// search for key in ImmutableWALs
-		immWALList := snapshot.state.immWAL
+		immWALList := snapshot.immWALs
 		for i := 0; i < immWALList.Len(); i++ {
-			table := immWALList.At(i).table
-			val, ok := table.get(key).Get()
+			immWAL := immWALList.At(i)
+			val, ok := immWAL.Get(key).Get()
 			if ok { // key is present or tombstoned
 				return checkValue(val)
 			}
@@ -156,56 +154,50 @@ func (db *DB) GetWithOptions(key []byte, options ReadOptions) ([]byte, error) {
 	}
 
 	// search for key in mutable memtable
-	val, ok := snapshot.memtable.get(key).Get()
+	val, ok := snapshot.memtable.Get(key).Get()
 	if ok { // key is present or tombstoned
 		return checkValue(val)
 	}
 	// search for key in Immutable memtables
-	immMemtables := snapshot.state.immMemtable
+	immMemtables := snapshot.immMemtables
 	for i := 0; i < immMemtables.Len(); i++ {
-		table := immMemtables.At(i).table
-		val, ok := table.get(key).Get()
+		immTable := immMemtables.At(i)
+		val, ok := immTable.Get(key).Get()
 		if ok {
 			return checkValue(val)
 		}
 	}
 
 	// search for key in SSTs in L0
-	for _, sst := range snapshot.state.core.l0 {
+	for _, sst := range snapshot.core.l0 {
 		if db.sstMayIncludeKey(sst, key) {
-			iter, err := newSSTIteratorFromKey(&sst, key, db.tableStore.clone(), 1, 1)
+			iter, err := sstable.NewIteratorAtKey(&sst, key, db.tableStore.Clone(), 1, 1)
 			if err != nil {
 				return nil, err
 			}
 
-			entry, err := iter.NextEntry()
-			if err != nil {
+			kv, ok := iter.NextEntry()
+			if !ok {
 				return nil, err
 			}
 
-			kv, ok := entry.Get()
 			if ok && bytes.Equal(kv.Key, key) {
-				return checkValue(kv.ValueDel)
+				return checkValue(kv.Value)
 			}
 		}
 	}
 
 	// search for key in compacted Sorted runs
-	for _, sr := range snapshot.state.core.compacted {
+	for _, sr := range snapshot.core.compacted {
 		if db.srMayIncludeKey(sr, key) {
-			iter, err := newSortedRunIteratorFromKey(sr, key, db.tableStore.clone(), 1, 1)
+			iter, err := newSortedRunIteratorFromKey(sr, key, db.tableStore.Clone(), 1, 1)
 			if err != nil {
 				return nil, err
 			}
 
-			entry, err := iter.NextEntry()
-			if err != nil {
-				return nil, err
-			}
-
-			kv, ok := entry.Get()
+			kv, ok := iter.NextEntry()
 			if ok && bytes.Equal(kv.Key, key) {
-				return checkValue(kv.ValueDel)
+				return checkValue(kv.Value)
 			}
 		}
 	}
@@ -220,18 +212,17 @@ func (db *DB) Delete(key []byte) {
 func (db *DB) DeleteWithOptions(key []byte, options WriteOptions) {
 	common.AssertTrue(len(key) > 0, "key cannot be empty")
 
-	currentWAL := db.state.wal
-	currentWAL.delete(key)
+	currentWAL := db.state.DeleteKVFromWAL(key)
 	if options.AwaitFlush {
-		<-currentWAL.table.awaitWALFlush()
+		currentWAL.Table().AwaitWALFlush()
 	}
 }
 
-func (db *DB) sstMayIncludeKey(sst SSTableHandle, key []byte) bool {
-	if !sst.rangeCoversKey(key) {
+func (db *DB) sstMayIncludeKey(sst sstable.Handle, key []byte) bool {
+	if !sst.RangeCoversKey(key) {
 		return false
 	}
-	filter, err := db.tableStore.readFilter(&sst)
+	filter, err := db.tableStore.ReadFilter(&sst)
 	if err == nil && filter.IsPresent() {
 		bFilter, _ := filter.Get()
 		return bFilter.HasKey(key)
@@ -245,7 +236,7 @@ func (db *DB) srMayIncludeKey(sr SortedRun, key []byte) bool {
 		return false
 	}
 	sst, _ := sstOption.Get()
-	filter, err := db.tableStore.readFilter(&sst)
+	filter, err := db.tableStore.ReadFilter(&sst)
 	if err == nil && filter.IsPresent() {
 		bFilter, _ := filter.Get()
 		return bFilter.HasKey(key)
@@ -256,7 +247,7 @@ func (db *DB) srMayIncludeKey(sr SortedRun, key []byte) bool {
 // this is to recover from a crash. we read the WALs from object store (considered to be Uncommmitted)
 // and write the kv pairs to memtable
 func (db *DB) replayWAL() error {
-	walIDLastCompacted := db.state.getState().core.lastCompactedWalSSTID
+	walIDLastCompacted := db.state.LastCompactedWALID()
 	walSSTList, err := db.tableStore.getWalSSTList(walIDLastCompacted)
 	if err != nil {
 		return err
@@ -265,26 +256,22 @@ func (db *DB) replayWAL() error {
 	lastSSTID := walIDLastCompacted
 	for _, sstID := range walSSTList {
 		lastSSTID = sstID
-		sst, err := db.tableStore.openSST(newSSTableIDWal(sstID))
+		sst, err := db.tableStore.OpenSST(sstable.NewIDWal(sstID))
 		if err != nil {
 			return err
 		}
-		common.AssertTrue(sst.id.walID().IsPresent(), "Invalid WAL ID")
+		common.AssertTrue(sst.Id.WalID().IsPresent(), "Invalid WAL ID")
 
 		// iterate through kv pairs in sst and populate walReplayBuf
-		iter, err := newSSTIterator(sst, db.tableStore.clone(), 1, 1)
+		iter, err := sstable.NewIterator(sst, db.tableStore.Clone(), 1, 1)
 		if err != nil {
 			return err
 		}
 
-		walReplayBuf := make([]common.KVDeletable, 0)
+		walReplayBuf := make([]types.RowEntry, 0)
 		for {
-			entry, err := iter.NextEntry()
-			if err != nil {
-				return err
-			}
-			kvDel, _ := entry.Get()
-			if entry.IsAbsent() {
+			kvDel, ok := iter.NextEntry()
+			if !ok {
 				break
 			}
 			walReplayBuf = append(walReplayBuf, kvDel)
@@ -292,25 +279,25 @@ func (db *DB) replayWAL() error {
 
 		// update memtable with kv pairs in walReplayBuf
 		for _, kvDel := range walReplayBuf {
-			if kvDel.ValueDel.IsTombstone {
-				db.state.memtable.delete(kvDel.Key)
+			if kvDel.Value.IsTombstone() {
+				db.state.DeleteKVFromMemtable(kvDel.Key)
 			} else {
-				db.state.memtable.put(kvDel.Key, kvDel.ValueDel.Value)
+				db.state.PutKVToMemtable(kvDel.Key, kvDel.Value.Value)
 			}
 		}
 
 		db.maybeFreezeMemtable(db.state, sstID)
-		if db.state.state.core.nextWalSstID == sstID {
+		if db.state.NextWALID() == sstID {
 			db.state.incrementNextWALID()
 		}
 	}
 
-	common.AssertTrue(lastSSTID+1 == db.state.getState().core.nextWalSstID, "")
+	common.AssertTrue(lastSSTID+1 == db.state.NextWALID(), "")
 	return nil
 }
 
 func (db *DB) maybeFreezeMemtable(state *DBState, walID uint64) {
-	if state.memtable.size.Load() < int64(db.options.L0SSTSizeBytes) {
+	if state.Memtable().Size() < int64(db.opts.L0SSTSizeBytes) {
 		return
 	}
 	state.freezeMemtable(walID)
@@ -320,7 +307,7 @@ func (db *DB) maybeFreezeMemtable(state *DBState, walID uint64) {
 // FlushMemtableToL0 - Normally Memtable is flushed to Level0 of object store when it reaches a size of DBOptions.L0SSTSizeBytes
 // This method allows the user to flush Memtable to Level0 irrespective of Memtable size.
 func (db *DB) FlushMemtableToL0() error {
-	lastWalID := db.state.memtable.lastWalID
+	lastWalID := db.state.Memtable().LastWalID()
 	if lastWalID.IsAbsent() {
 		return errors.New("WAL is not yet flushed to Memtable")
 	}
@@ -331,6 +318,7 @@ func (db *DB) FlushMemtableToL0() error {
 	flusher := MemtableFlusher{
 		db:       db,
 		manifest: db.manifest,
+		log:      db.opts.Log,
 	}
 	return flusher.flushImmMemtablesToL0()
 }
@@ -365,7 +353,7 @@ func newDB(
 	state := newDBState(coreDBState)
 	db := &DB{
 		state:                   state,
-		options:                 options,
+		opts:                    options,
 		tableStore:              tableStore,
 		memtableFlushNotifierCh: memtableFlushNotifierCh,
 		walFlushTaskWG:          &sync.WaitGroup{},
@@ -378,7 +366,7 @@ func newDB(
 	return db, nil
 }
 
-func checkValue(val common.ValueDeletable) ([]byte, error) {
+func checkValue(val types.Value) ([]byte, error) {
 	if val.GetValue().IsAbsent() { // key is tombstoned/deleted
 		return nil, common.ErrKeyNotFound
 	} else { // key is present
